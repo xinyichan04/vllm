@@ -14,6 +14,7 @@ from fastapi import FastAPI
 
 from vllm import envs
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.launchers.utils import conn_trace
 from vllm.entrypoints.launchers.utils.ssl import SSLCertRefresher
 from vllm.entrypoints.serve.utils.api_utils import (
     log_non_default_args,
@@ -92,11 +93,17 @@ async def serve_http(
     if h11_max_header_count is None:
         h11_max_header_count = H11_MAX_HEADER_COUNT_DEFAULT
 
-    config = uvicorn.Config(app, **uvicorn_kwargs)
+    config = uvicorn.Config(
+        conn_trace.wrap_app(app) if envs.VLLM_CONN_TRACE else app, **uvicorn_kwargs
+    )
     # Set header limits
     config.h11_max_incomplete_event_size = h11_max_incomplete_event_size
     config.h11_max_header_count = h11_max_header_count
     config.load()
+    if envs.VLLM_CONN_TRACE:
+        config.http_protocol_class = conn_trace.traced_protocol_class(
+            config.http_protocol_class
+        )
     server = NoSignalServer(config)
     app.state.server = server
 
@@ -216,6 +223,8 @@ def create_server_socket(
     if reuse_port:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
     sock.bind(addr)
+    if envs.VLLM_CONN_TRACE:
+        conn_trace.enable_save_syn(sock)
 
     return sock
 

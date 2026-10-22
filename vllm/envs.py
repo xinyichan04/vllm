@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     VERBOSE: bool = False
     VLLM_ALLOW_LONG_MAX_MODEL_LEN: bool = False
     VLLM_HTTP_TIMEOUT_KEEP_ALIVE: int = 5  # seconds
+    VLLM_CONN_TRACE: str | None = None
     VLLM_MAX_N_SEQUENCES: int = 16384
     VLLM_MAX_COMPLETION_PROMPTS: int = 1024
     VLLM_MAX_STOP_STRINGS: int = 4
@@ -1128,6 +1129,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": lambda: int(
         os.environ.get("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "5")
     ),
+    # If set, path of a JSONL file to which the API server writes per-connection
+    # receive-path events (saved SYN, accept, header/body parse milestones).
+    "VLLM_CONN_TRACE": lambda: os.environ.get("VLLM_CONN_TRACE", None),
     # Maximum allowed value for the `n` sampling parameter (number of output
     # sequences per request). Limits resource consumption to prevent
     # denial-of-service via excessively large fan-out. Default: 16384.
@@ -2320,6 +2324,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
+        "VLLM_CONN_TRACE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
         "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
         "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH",
