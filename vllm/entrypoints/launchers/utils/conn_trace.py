@@ -6,6 +6,10 @@ Writes one JSON line per event so the life of a request can be reconstructed
 from the earliest point vLLM can observe it up to the last request byte:
 
     listen_armed      listening socket created with TCP_SAVE_SYN
+    syn_seen          a SYN for the listening port, seen live on a raw
+                      AF_PACKET socket (needs CAP_NET_RAW in the socket's
+                      network namespace); carries the kernel's receive
+                      timestamp and the time this process saw it
     factory           uvicorn protocol constructed; uvloop calls this from its
                       listen callback *before* accept4(), so it is the first
                       Python code that runs for a new connection
@@ -18,10 +22,13 @@ from the earliest point vLLM can observe it up to the last request byte:
     message_complete  last request byte parsed: the full request is in
     connection_lost   connection closed
 
-The SYN itself is handled entirely by the kernel and cannot be observed live
-from userspace. TCP_SAVE_SYN makes the kernel keep the SYN's IP+TCP headers so
-they can be read back once at accept time, and ``tcpi_last_ack_recv`` (jiffies
-resolution) dates the final handshake ACK.
+The kernel handles the handshake itself, so the TCP stack never tells the
+server about a SYN. Two ways around that are used here: a packet socket sees
+the SYN on the interface as it arrives (syn_seen), and TCP_SAVE_SYN makes the
+kernel keep the SYN's IP+TCP headers so they can be read back at accept time,
+with ``tcpi_last_ack_recv`` (jiffies resolution) dating the final handshake
+ACK. The second needs no privileges and is the fallback when the first is not
+permitted.
 """
 
 import itertools
@@ -29,6 +36,7 @@ import json
 import os
 import socket
 import struct
+import threading
 import time
 from typing import Any
 
@@ -47,6 +55,7 @@ SCOPE_KEY = "vllm.conn_trace_id"
 
 _conn_ids = itertools.count(1)
 _fh = None
+_lock = threading.Lock()
 
 
 def _emit(ev: str, conn: int | None, **fields: Any) -> None:
@@ -64,12 +73,92 @@ def _emit(ev: str, conn: int | None, **fields: Any) -> None:
         "ns": time.perf_counter_ns(),
         **fields,
     }
-    _fh.write(json.dumps(rec) + "\n")
+    with _lock:
+        _fh.write(json.dumps(rec) + "\n")
 
 
 def _flush() -> None:
     if _fh is not None:
         _fh.flush()
+
+
+ETH_P_ALL = 0x0003
+SO_ATTACH_FILTER = 26
+SO_TIMESTAMPNS = 35
+
+
+def _syn_filter(port: int) -> bytes:
+    """Classic BPF: IPv4 TCP, not a fragment, dst port == port, SYN without ACK."""
+    insns = [
+        (0x28, 0, 0, 12),  # ldh [12]            ethertype
+        (0x15, 0, 11, 0x0800),  # jne IPv4 -> drop
+        (0x30, 0, 0, 23),  # ldb [23]            IP protocol
+        (0x15, 0, 9, 6),  # jne TCP -> drop
+        (0x28, 0, 0, 20),  # ldh [20]            fragment offset
+        (0x45, 7, 0, 0x1FFF),  # jset -> drop
+        (0xB1, 0, 0, 14),  # ldxb 4*([14]&0xf)  IP header length
+        (0x48, 0, 0, 16),  # ldh [x+16]         TCP dst port
+        (0x15, 0, 4, port),  # jne port -> drop
+        (0x50, 0, 0, 27),  # ldb [x+27]         TCP flags
+        (0x54, 0, 0, 0x12),  # and SYN|ACK
+        (0x15, 0, 1, 0x02),  # jne SYN-only -> drop
+        (0x06, 0, 0, 0x40000),  # accept
+        (0x06, 0, 0, 0),  # drop
+    ]
+    return b"".join(struct.pack("HBBI", *i) for i in insns)
+
+
+def _watch_syns(raw: socket.socket) -> None:
+    while True:
+        try:
+            data, anc, _flags, addr = raw.recvmsg(128, 64)
+        except OSError:
+            return
+        t_seen = time.time()
+        # Loopback shows each packet twice; keep the arriving copy.
+        if addr[2] == socket.PACKET_OUTGOING:
+            continue
+        t_kernel = None
+        for _level, kind, cdata in anc:
+            if kind == SO_TIMESTAMPNS:
+                sec, nsec = struct.unpack("qq", cdata[:16])
+                t_kernel = sec + nsec / 1e9
+        ihl = (data[14] & 0x0F) * 4
+        syn = _parse_syn(data[14:])
+        tcp = syn.get("tcp") or {}
+        _emit(
+            "syn_seen",
+            None,
+            iface=addr[0],
+            peer=[socket.inet_ntoa(data[26:30]), tcp.get("sport")],
+            seq=tcp.get("seq"),
+            t_kernel=t_kernel,
+            ip_hdr_len=ihl,
+        )
+
+
+def start_syn_watcher(port: int) -> bool:
+    """Watch for SYNs to `port` on a raw packet socket, in a daemon thread.
+
+    Needs CAP_NET_RAW in this network namespace; returns False without it.
+    The BPF filter runs in the kernel, so only matching SYNs wake the thread.
+    """
+    try:
+        raw = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
+    except (OSError, AttributeError) as exc:
+        logger.warning("conn_trace: live SYN capture unavailable: %s", exc)
+        return False
+    import ctypes
+
+    prog = _syn_filter(port)
+    buf = ctypes.create_string_buffer(prog)
+    fprog = struct.pack("HL", len(prog) // 8, ctypes.addressof(buf))
+    raw.setsockopt(socket.SOL_SOCKET, SO_ATTACH_FILTER, fprog)
+    raw.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS, 1)
+    threading.Thread(
+        target=_watch_syns, args=(raw,), name="conn-trace-syn", daemon=True
+    ).start()
+    return True
 
 
 def enable_save_syn(sock: socket.socket) -> None:
@@ -80,7 +169,9 @@ def enable_save_syn(sock: socket.socket) -> None:
     except OSError as exc:
         logger.warning("conn_trace: TCP_SAVE_SYN unavailable: %s", exc)
         ok = False
-    _emit("listen_armed", None, addr=list(sock.getsockname()), save_syn=ok)
+    addr = sock.getsockname()
+    live = start_syn_watcher(addr[1])
+    _emit("listen_armed", None, addr=list(addr), save_syn=ok, live_syn=live)
     _flush()
 
 
